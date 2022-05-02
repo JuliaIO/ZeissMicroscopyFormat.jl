@@ -1,13 +1,15 @@
 module ZeissMicroscopyFormat
 
 using Mmap
+using Dates
 
 using FileIO
-using TiffImages
 using OMETIFF
+using EzXML
 using FixedPointNumbers
 using ColorTypes
 using ImageMetadata
+using Unitful
 using LazyStack
 
 # Documentation on this format is proprietary but available by request for free:
@@ -34,6 +36,8 @@ const pixeltypes = Dict{Int32,DataType}(
     # unsupported: 10 => Gray{Complex{Float32}}, 11 => BGR{Complex{Float32}}
     12 => Gray{N0f32}
 )
+
+const zeissdtfmt = dateformat"y-m-dTH:M:S.s"
 
 struct DimensionEntryDV
     dimension::Char
@@ -190,6 +194,8 @@ function load(s::Stream{format"CZI"}; keywords...)
     T = pixeltypes[pixeltype]
     nb = sizeof(T)::Int
     @assert all(d -> iszero(d.fileposition % nb), entries) "FIXME: chunk boundaries are not aligned"
+    C, axs, shear = layout(omexml, T)
+    @show C axs shear
     seek(s, 0)
     mm = Mmap.mmap(s.io, Vector{T}, filesize(s.io) ÷ nb)
     blocks = [makeview(mm, entry, nb) for entry in entries]
@@ -210,6 +216,71 @@ function makeview(v, entry, nb)
         end
     end
     return reshape(view(v, start:start+nel-1), sz)
+end
+
+function layout(omexml, ::Type{T}) where T
+    imagenode = only(filter!(node -> !isempty(eachelement(node)), findall("//Image", omexml)))
+    axs = Dict{Symbol,Any}()
+    szs = Dict{Symbol,Int}()
+    wavelengths = Float32[]
+    shear = nothing
+    for node in eachelement(imagenode)
+        nn = nodename(node)
+        if startswith(nn, "Size")
+            sym = Symbol(nn[end])
+            szs[sym] = parse(Int, nodecontent(node))
+        elseif nn == "Dimensions"
+            for subnode in eachelement(node)
+                nn = nodename(subnode)
+                if nn == "Channels"
+                    for cnode in eachelement(subnode)
+                        for anode in eachelement(cnode)
+                            nn = nodename(anode)
+                            if nn == "EmissionWavelength"
+                                push!(wavelengths, parse(Float32, nodecontent(anode)))
+                            end
+                        end
+                    end
+                elseif nn == "T"
+                    starttime, start, increment = nothing, nothing, nothing
+                    for anode in eachelement(subnode)
+                        nn = nodename(anode)
+                        if nn == "StartTime"
+                            starttime = nodecontent(anode)
+                        elseif nn == "Positions"
+                            start, increment = parse_positions(anode)
+                        end
+                    end
+                    idx = findfirst('.', starttime)
+                    starttime = DateTime(starttime[1:idx+3], zeissdtfmt)   # TODO: do something with this?
+                    axs[:T] = range(start * u"s", step=increment * u"s", length=szs[:T])
+                elseif nn == "Z"
+                    start, increment = nothing, nothing
+                    for anode in eachelement(subnode)
+                        nn = nodename(anode)
+                        if nn == "ZAxisShear"
+                            shear = nodecontent(anode)
+                        elseif nn == "Positions"
+                            start, increment = parse_positions(anode)
+                        end
+                    end
+                    axs[:Z] = range(start * u"μm", step=increment * u"μm", length=szs[:Z])
+                end
+            end
+        end
+    end
+    return wavelengths, axs, shear
+end
+
+function parse_positions(node)
+    node = only(eachelement(node))  # Interval
+    startnode = firstelement(node)
+    @assert nodename(startnode) == "Start"
+    start = nodecontent(startnode)
+    incnode = nextelement(startnode)
+    @assert nodename(incnode) == "Increment"
+    increment = nodecontent(incnode)
+    return parse(Float64, start), parse(Float64, increment)
 end
 
 end
